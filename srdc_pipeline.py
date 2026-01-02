@@ -73,7 +73,8 @@ else:  # 'auto'
 if use_gpu_opencv:
     print("OpenCV: CUDA GPU detected. Using GPU for OpenCV tasks where possible.")
     try:
-        print(f"OpenCV: CUDA device: {cv2.cuda.getDeviceName(cv2.cuda.getDevice())}")
+        device_id = cv2.cuda.getDevice()
+        print(f"OpenCV: Using CUDA device #{device_id}")
     except cv2.error as e:
         print(f"OpenCV: CUDA device details error: {e}")
         use_gpu_opencv = False
