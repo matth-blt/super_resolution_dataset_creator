@@ -60,6 +60,13 @@ INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE = 0.06 # For the first match, search +
 SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS = 5   # For later matches, use a smaller, fixed window to account for drift.
 FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS = 10.0 # Fallback window if video duration is unknown.
 
+# --- Frame Matching Acceleration ---
+MATCH_USE_GPU = 'auto'  # 'auto' = use GPU if available, 'cpu' = force CPU, 'gpu' = force GPU (fails if unavailable)
+MATCH_ENABLE_CACHING = True  # Cache HR images for faster matching
+MATCH_CACHE_MODE = 'vram'  # 'ram' = system memory (slower), 'vram' = GPU memory (faster, auto-detects capacity)
+MATCH_CACHE_MAX_IMAGES = 0  # Maximum images to cache per video. 0 = auto-detect (VRAM) or unlimited (RAM)
+MATCH_VRAM_SAFETY_MARGIN = 0.8  # Safety margin for VRAM cache (0.8 = use only 80% of detected capacity)
+
 # --- Stage 6: Deduplication ---
 PHASH_SIMILARITY_THRESHOLD = 4 # Removes visually similar pairs. Lower is stricter. Set to -1 to disable.
 

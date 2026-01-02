@@ -52,11 +52,23 @@ def _find_executable(name, configured_path):
     print(f"ERROR: {name} not found. Set path in config.py or install.")
     return None
 
-# OpenCV and CUDA detection
+# OpenCV and CUDA detection + config-based GPU mode selection
 print(f"OpenCV version: {cv2.__version__}")
 CUDA_AVAILABLE_OPENCV = cv2.cuda.getCudaEnabledDeviceCount() > 0
 print(f"OpenCV CUDA available: {CUDA_AVAILABLE_OPENCV}")
-use_gpu_opencv = CUDA_AVAILABLE_OPENCV
+
+# Determine GPU usage based on config
+_match_gpu_mode = getattr(config, 'MATCH_USE_GPU', 'auto').lower()
+if _match_gpu_mode == 'gpu':
+    if not CUDA_AVAILABLE_OPENCV:
+        print("FATAL: MATCH_USE_GPU='gpu' but no CUDA-enabled OpenCV available!")
+        exit(1)
+    use_gpu_opencv = True
+elif _match_gpu_mode == 'cpu':
+    use_gpu_opencv = False
+    print("OpenCV: Forcing CPU mode (MATCH_USE_GPU='cpu')")
+else:  # 'auto'
+    use_gpu_opencv = CUDA_AVAILABLE_OPENCV
 
 if use_gpu_opencv:
     print("OpenCV: CUDA GPU detected. Using GPU for OpenCV tasks where possible.")
@@ -65,8 +77,128 @@ if use_gpu_opencv:
     except cv2.error as e:
         print(f"OpenCV: CUDA device details error: {e}")
         use_gpu_opencv = False
-else:
+elif _match_gpu_mode != 'cpu':
     print("OpenCV: No CUDA GPU for OpenCV. Using CPU.")
+
+# === VRAM Cache Helper Functions ===
+# Global to remember detected VRAM capacity across videos
+_detected_vram_capacity = None
+
+def detect_vram_cache_capacity(sample_images: list, folder_path: Path, safety_margin: float = 0.8) -> int:
+    """
+    Detect how many images can fit in VRAM by loading incrementally until OOM.
+    
+    Args:
+        sample_images: List of image filenames to test with
+        folder_path: Path to the image folder
+        safety_margin: Fraction of detected capacity to use (e.g., 0.8 = 80%)
+    
+    Returns:
+        Safe number of images that can be cached in VRAM
+    """
+    global _detected_vram_capacity
+    
+    # Return cached value if already detected
+    if _detected_vram_capacity is not None:
+        return _detected_vram_capacity
+    
+    if not use_gpu_opencv:
+        return 0
+    
+    print("  VRAM Capacity Detection: Testing...")
+    gpu_mats = []
+    loaded_count = 0
+    
+    try:
+        for img_name in sample_images:
+            try:
+                # Load and preprocess image
+                img = cv2.imread(str(folder_path / img_name))
+                if img is None:
+                    continue
+                gray_resized = cv2.cvtColor(
+                    cv2.resize(img, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                              interpolation=cv2.INTER_AREA), 
+                    cv2.COLOR_BGR2GRAY
+                )
+                
+                # Try to upload to VRAM
+                gpu_mat = cv2.cuda_GpuMat()
+                gpu_mat.upload(gray_resized)
+                gpu_mats.append(gpu_mat)
+                loaded_count += 1
+                
+            except cv2.error as e:
+                if 'memory' in str(e).lower() or 'cuda' in str(e).lower():
+                    # Hit VRAM limit
+                    print(f"  VRAM limit reached at {loaded_count} images")
+                    break
+                # Other error, skip this image
+                continue
+    finally:
+        # Free all test allocations
+        for gm in gpu_mats:
+            del gm
+        gpu_mats.clear()
+    
+    if loaded_count == 0:
+        print("  VRAM Detection: Could not load any images, falling back to RAM cache")
+        _detected_vram_capacity = 0
+        return 0
+    
+    # Apply safety margin
+    safe_capacity = max(1, int(loaded_count * safety_margin))
+    _detected_vram_capacity = safe_capacity
+    
+    img_size_mb = config.MATCH_RESIZE_WIDTH * config.MATCH_RESIZE_HEIGHT / (1024 * 1024)
+    print(f"  VRAM Capacity: {loaded_count} images max, using {safe_capacity} (margin: {safety_margin:.0%})")
+    print(f"  VRAM Usage: ~{safe_capacity * img_size_mb:.1f} MB for cache")
+    
+    return safe_capacity
+
+def build_vram_cache(image_names: list, folder_path: Path, max_images: int) -> dict:
+    """
+    Build a VRAM cache of GpuMat objects.
+    
+    Args:
+        image_names: List of image filenames to cache
+        folder_path: Path to the folder containing images
+        max_images: Maximum number of images to cache
+    
+    Returns:
+        Dict mapping image_name -> cv2.cuda_GpuMat
+    """
+    cache = {}
+    images_to_load = image_names[:max_images]
+    
+    for img_name in tqdm(images_to_load, desc="Loading to VRAM", leave=False):
+        try:
+            img = cv2.imread(str(folder_path / img_name))
+            if img is None:
+                continue
+            gray_resized = cv2.cvtColor(
+                cv2.resize(img, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                          interpolation=cv2.INTER_AREA), 
+                cv2.COLOR_BGR2GRAY
+            )
+            
+            gpu_mat = cv2.cuda_GpuMat()
+            gpu_mat.upload(gray_resized)
+            cache[img_name] = gpu_mat
+            
+        except cv2.error as e:
+            if 'memory' in str(e).lower():
+                print(f"  VRAM full at {len(cache)} images, stopping cache build")
+                break
+            continue
+    
+    return cache
+
+def free_vram_cache(cache: dict):
+    """Explicitly free all GpuMat objects in a VRAM cache."""
+    for gpu_mat in cache.values():
+        del gpu_mat
+    cache.clear()
 
 def update_progress(progress_file_path: Path, stage: str, item: str = None, completed: bool = False, item_key: str = 'items'):
     """Update progress tracking file."""
@@ -626,28 +758,103 @@ def filter_low_information_images(lr_base: Path, hr_base: Path, prog_file: Path)
     print(f"--- Low Info Filter Finished. LR Rem: {tot_lr_rem}, HR Rem: {tot_hr_rem} ---")
     update_progress(prog_file, stage, completed=True)
 
-def process_image_pair(lr_img_name: str, lr_folder_path: Path, lr_time: float, hr_candidate_img_names: list[str], hr_folder_path: Path, hr_timestamps_data: dict):
-    """Process a single LR image against HR candidates for matching."""
+def process_image_pair(lr_img_name: str, lr_folder_path: Path, lr_time: float, 
+                       hr_candidate_img_names: list[str], hr_folder_path: Path, 
+                       hr_timestamps_data: dict, hr_cache: dict = None, 
+                       vram_cache: dict = None, use_gpu: bool = False, gpu_matcher = None):
+    """
+    Process a single LR image against HR candidates for matching.
+    
+    Optimizations:
+    - GPU: Uses cv2.cuda template matching when use_gpu=True and gpu_matcher is provided
+    - RAM Cache: Uses pre-loaded HR images from hr_cache dict (numpy arrays)
+    - VRAM Cache: Uses pre-loaded HR images from vram_cache dict (GpuMat objects, fastest)
+    
+    Args:
+        hr_cache: Optional dict mapping hr_name -> grayscale numpy array (pre-resized)
+        vram_cache: Optional dict mapping hr_name -> cv2.cuda_GpuMat (already in VRAM)
+        use_gpu: Whether to use GPU acceleration
+        gpu_matcher: Pre-created cv2.cuda.TemplateMatching object (reuse for efficiency)
+    """
     try:
         lr_frame = cv2.imread(str(lr_folder_path / lr_img_name))
         assert lr_frame is not None
-        lr_gray_resized = cv2.cvtColor(cv2.resize(lr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+        lr_gray_resized = cv2.cvtColor(
+            cv2.resize(lr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                      interpolation=cv2.INTER_AREA), 
+            cv2.COLOR_BGR2GRAY
+        )
     except (cv2.error, AssertionError):
         return None
 
+    # Upload LR to GPU once if using GPU
+    gpu_lr = None
+    if use_gpu and gpu_matcher is not None:
+        try:
+            gpu_lr = cv2.cuda_GpuMat()
+            gpu_lr.upload(lr_gray_resized)
+        except cv2.error:
+            use_gpu = False  # Fallback to CPU for this call
+
     best_hr_name, best_score, matched_hr_ts = None, float('-inf'), None
+    
     for hr_name in hr_candidate_img_names:
         try:
-            hr_frame = cv2.imread(str(hr_folder_path / hr_name))
-            assert hr_frame is not None
-            hr_gray_resized = cv2.cvtColor(cv2.resize(hr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
-            _, cur_score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(hr_gray_resized, lr_gray_resized, cv2.TM_CCOEFF_NORMED))
+            gpu_hr = None
+            hr_gray_resized = None
+            
+            # Priority: VRAM cache > RAM cache > disk load
+            if vram_cache is not None and hr_name in vram_cache:
+                # Already in VRAM - no upload needed!
+                gpu_hr = vram_cache[hr_name]
+            elif hr_cache is not None and hr_name in hr_cache:
+                # In RAM cache - need upload if using GPU
+                hr_gray_resized = hr_cache[hr_name]
+            else:
+                # Load from disk
+                hr_frame = cv2.imread(str(hr_folder_path / hr_name))
+                assert hr_frame is not None
+                hr_gray_resized = cv2.cvtColor(
+                    cv2.resize(hr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                              interpolation=cv2.INTER_AREA), 
+                    cv2.COLOR_BGR2GRAY
+                )
+            
+            # GPU or CPU template matching
+            if use_gpu and gpu_matcher is not None and gpu_lr is not None:
+                try:
+                    # Use existing GpuMat from VRAM cache or upload from RAM/disk
+                    if gpu_hr is None:
+                        gpu_hr = cv2.cuda_GpuMat()
+                        gpu_hr.upload(hr_gray_resized)
+                    
+                    result_gpu = gpu_matcher.match(gpu_hr, gpu_lr)
+                    result = result_gpu.download()
+                    _, cur_score, _, _ = cv2.minMaxLoc(result)
+                except cv2.error:
+                    # Fallback to CPU on GPU error
+                    if hr_gray_resized is None and gpu_hr is not None:
+                        hr_gray_resized = gpu_hr.download()
+                    _, cur_score, _, _ = cv2.minMaxLoc(
+                        cv2.matchTemplate(hr_gray_resized, lr_gray_resized, cv2.TM_CCOEFF_NORMED)
+                    )
+            else:
+                # CPU path - need numpy array
+                if hr_gray_resized is None and gpu_hr is not None:
+                    hr_gray_resized = gpu_hr.download()
+                _, cur_score, _, _ = cv2.minMaxLoc(
+                    cv2.matchTemplate(hr_gray_resized, lr_gray_resized, cv2.TM_CCOEFF_NORMED)
+                )
+            
             if cur_score > best_score:
                 best_score, best_hr_name, matched_hr_ts = cur_score, hr_name, hr_timestamps_data.get(hr_name)
+                
         except (cv2.error, AssertionError):
             continue
     
-    return (best_hr_name, best_score, lr_time, matched_hr_ts) if best_hr_name and best_score >= config.MATCH_THRESHOLD and matched_hr_ts is not None else None
+    if best_hr_name and best_score >= config.MATCH_THRESHOLD and matched_hr_ts is not None:
+        return (best_hr_name, best_score, lr_time, matched_hr_ts)
+    return None
 
 def filter_temporal_inconsistency(matches: list, video_name: str) -> list:
     """Filter matches to maintain temporal consistency."""
@@ -662,7 +869,13 @@ def filter_temporal_inconsistency(matches: list, video_name: str) -> list:
     return filtered
 
 def process_folder_pair(lr_extracted_base: Path, hr_extracted_base: Path, out_lr_matched: Path, out_hr_matched: Path, prog_file: Path):
-    """Process LR/HR folder pairs for frame matching."""
+    """
+    Process LR/HR folder pairs for frame matching.
+    
+    Optimizations applied:
+    - HR Image Caching: Pre-loads HR images into memory (configurable via MATCH_ENABLE_CACHING)
+    - GPU Template Matching: Uses CUDA when available (configurable via MATCH_USE_GPU)
+    """
     stage = 'match'
     prog_data = get_progress(prog_file)
     if prog_data.get(stage, {}).get('completed', False):
@@ -676,6 +889,28 @@ def process_folder_pair(lr_extracted_base: Path, hr_extracted_base: Path, out_lr
         return
     print(f"Found {len(common_names)} common video folders for matching.")
     processed = prog_data.get(stage, {}).get('items', [])
+
+    # === GPU Matcher Setup (created once, reused for all videos) ===
+    gpu_matcher = None
+    _use_gpu = use_gpu_opencv
+    if _use_gpu:
+        try:
+            gpu_matcher = cv2.cuda.createTemplateMatching(cv2.CV_8UC1, cv2.TM_CCOEFF_NORMED)
+            print("GPU Template Matching: Initialized successfully")
+        except cv2.error as e:
+            print(f"GPU Template Matching initialization failed: {e}. Falling back to CPU.")
+            _use_gpu = False
+
+    # === Config for caching ===
+    _enable_cache = getattr(config, 'MATCH_ENABLE_CACHING', True)
+    _cache_mode = getattr(config, 'MATCH_CACHE_MODE', 'ram').lower()
+    _cache_max = getattr(config, 'MATCH_CACHE_MAX_IMAGES', 0)
+    _vram_margin = getattr(config, 'MATCH_VRAM_SAFETY_MARGIN', 0.8)
+    
+    # VRAM mode requires GPU
+    if _cache_mode == 'vram' and not _use_gpu:
+        print("  Warning: VRAM cache mode requires GPU. Falling back to RAM cache.")
+        _cache_mode = 'ram'
 
     for vid_name in common_names:
         if vid_name in processed: continue
@@ -703,35 +938,150 @@ def process_folder_pair(lr_extracted_base: Path, hr_extracted_base: Path, out_lr
             update_progress(prog_file, stage, item=vid_name)
             continue
 
+        # === Determine cache capacity ===
+        hr_cache = None
+        vram_cache = None
+        vram_batch_size = 0
+        
+        if _enable_cache:
+            if _cache_mode == 'vram':
+                # Detect VRAM capacity on first video
+                vram_batch_size = detect_vram_cache_capacity(hr_imgs, hr_fld, _vram_margin)
+                if vram_batch_size > 0:
+                    vram_batch_size = min(vram_batch_size, _cache_max) if _cache_max > 0 else vram_batch_size
+                    print(f"  VRAM cache mode: will process in batches of {vram_batch_size}")
+                else:
+                    print("  VRAM detection failed, falling back to RAM cache")
+                    _cache_mode = 'ram'
+            
+            if _cache_mode == 'ram':
+                # RAM cache - load all at once
+                cache_limit = _cache_max if _cache_max > 0 else len(hr_imgs)
+                images_to_cache = hr_imgs[:cache_limit]
+                
+                est_memory_mb = len(images_to_cache) * config.MATCH_RESIZE_WIDTH * config.MATCH_RESIZE_HEIGHT / (1024 * 1024)
+                print(f"  Building RAM cache for {vid_name}: {len(images_to_cache)} images (~{est_memory_mb:.1f} MB)")
+                
+                hr_cache = {}
+                for hr_name in tqdm(images_to_cache, desc=f"Caching {vid_name}", leave=False):
+                    try:
+                        hr_frame = cv2.imread(str(hr_fld / hr_name))
+                        if hr_frame is not None:
+                            hr_cache[hr_name] = cv2.cvtColor(
+                                cv2.resize(hr_frame, (config.MATCH_RESIZE_WIDTH, config.MATCH_RESIZE_HEIGHT), 
+                                          interpolation=cv2.INTER_AREA), 
+                                cv2.COLOR_BGR2GRAY
+                            )
+                    except cv2.error:
+                        continue
+                
+                print(f"  RAM cache built: {len(hr_cache)}/{len(images_to_cache)} images loaded")
+
         raw_matches, last_lr_ts, last_hr_ts, first_match_done = [], None, None, False
         initial_win_secs = lr_dur * config.INITIAL_MATCH_CANDIDATE_WINDOW_PERCENTAGE
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            futures = {}
-            for lr_name in lr_imgs:
-                lr_time = lr_ts_data.get(lr_name)
-                if lr_time is None: continue
+        
+        # Log optimization status
+        opt_status = []
+        if _use_gpu and gpu_matcher: opt_status.append("GPU")
+        else: opt_status.append("CPU")
+        if _cache_mode == 'vram' and vram_batch_size > 0:
+            opt_status.append(f"VRAM(batch={vram_batch_size})")
+        elif hr_cache:
+            opt_status.append(f"RAM({len(hr_cache)})")
+        print(f"  Matching {vid_name} with: {', '.join(opt_status)}")
+        
+        # === VRAM batch processing ===
+        if _cache_mode == 'vram' and vram_batch_size > 0:
+            # Process HR images in VRAM-sized batches
+            for batch_start in range(0, len(hr_imgs), vram_batch_size):
+                batch_end = min(batch_start + vram_batch_size, len(hr_imgs))
+                batch_hr_imgs = hr_imgs[batch_start:batch_end]
                 
-                if not first_match_done:
-                    min_hr_t, max_hr_t = lr_time - initial_win_secs, lr_time + initial_win_secs
-                elif last_lr_ts is not None and last_hr_ts is not None:
-                    expected_hr_t = last_hr_ts + (lr_time - last_lr_ts)
-                    min_hr_t, max_hr_t = expected_hr_t - config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS, expected_hr_t + config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS
-                else:
-                    min_hr_t, max_hr_t = lr_time - config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS, lr_time + config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                print(f"    Loading VRAM batch {batch_start//vram_batch_size + 1}: {len(batch_hr_imgs)} images")
+                vram_cache = build_vram_cache(batch_hr_imgs, hr_fld, len(batch_hr_imgs))
                 
-                hr_candidates = [hr_n for hr_n in hr_imgs if min_hr_t <= hr_ts_data.get(hr_n, float('-inf')) <= max_hr_t]
-                if hr_candidates:
-                    futures[executor.submit(process_image_pair, lr_name, lr_fld, lr_time, hr_candidates, hr_fld, hr_ts_data)] = (lr_name, lr_time)
+                # Find LR images that might match this batch of HR images
+                batch_hr_times = {hr_ts_data.get(n, float('inf')) for n in batch_hr_imgs}
+                batch_min_t = min(batch_hr_times) - config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                batch_max_t = max(batch_hr_times) + config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                
+                batch_lr_imgs = [n for n in lr_imgs if batch_min_t <= lr_ts_data.get(n, float('-inf')) <= batch_max_t]
+                
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    futures = {}
+                    for lr_name in batch_lr_imgs:
+                        lr_time = lr_ts_data.get(lr_name)
+                        if lr_time is None: continue
+                        
+                        if not first_match_done:
+                            min_hr_t, max_hr_t = lr_time - initial_win_secs, lr_time + initial_win_secs
+                        elif last_lr_ts is not None and last_hr_ts is not None:
+                            expected_hr_t = last_hr_ts + (lr_time - last_lr_ts)
+                            min_hr_t, max_hr_t = expected_hr_t - config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS, expected_hr_t + config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS
+                        else:
+                            min_hr_t, max_hr_t = lr_time - config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS, lr_time + config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                        
+                        # Only check HR candidates that are in the current VRAM batch
+                        hr_candidates = [hr_n for hr_n in batch_hr_imgs if min_hr_t <= hr_ts_data.get(hr_n, float('-inf')) <= max_hr_t]
+                        if hr_candidates:
+                            futures[executor.submit(
+                                process_image_pair, lr_name, lr_fld, lr_time, hr_candidates, hr_fld, hr_ts_data,
+                                hr_cache=None, vram_cache=vram_cache, use_gpu=_use_gpu, gpu_matcher=gpu_matcher
+                            )] = (lr_name, lr_time)
 
-            for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Matching {vid_name}"):
-                lr_name_done, lr_time_done = futures[fut]
-                try:
-                    if res := fut.result():
-                        raw_matches.append((lr_name_done, res[0], res[2], res[3]))
-                        if not first_match_done or res[2] > last_lr_ts:
-                            last_lr_ts, last_hr_ts, first_match_done = res[2], res[3], True
-                except Exception as e:
-                    print(f"Match worker error for {lr_name_done} ({vid_name}): {e}")
+                    for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), 
+                                   desc=f"Matching batch {batch_start//vram_batch_size + 1}", leave=False):
+                        lr_name_done, lr_time_done = futures[fut]
+                        try:
+                            if res := fut.result():
+                                raw_matches.append((lr_name_done, res[0], res[2], res[3]))
+                                if not first_match_done or res[2] > last_lr_ts:
+                                    last_lr_ts, last_hr_ts, first_match_done = res[2], res[3], True
+                        except Exception as e:
+                            print(f"Match worker error for {lr_name_done} ({vid_name}): {e}")
+                
+                # Free VRAM batch before loading next
+                free_vram_cache(vram_cache)
+                vram_cache = None
+        else:
+            # === RAM cache or no cache - process all at once ===
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                futures = {}
+                for lr_name in lr_imgs:
+                    lr_time = lr_ts_data.get(lr_name)
+                    if lr_time is None: continue
+                    
+                    if not first_match_done:
+                        min_hr_t, max_hr_t = lr_time - initial_win_secs, lr_time + initial_win_secs
+                    elif last_lr_ts is not None and last_hr_ts is not None:
+                        expected_hr_t = last_hr_ts + (lr_time - last_lr_ts)
+                        min_hr_t, max_hr_t = expected_hr_t - config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS, expected_hr_t + config.SUBSEQUENT_MATCH_CANDIDATE_WINDOW_SECONDS
+                    else:
+                        min_hr_t, max_hr_t = lr_time - config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS, lr_time + config.FALLBACK_MATCH_CANDIDATE_WINDOW_SECONDS
+                    
+                    hr_candidates = [hr_n for hr_n in hr_imgs if min_hr_t <= hr_ts_data.get(hr_n, float('-inf')) <= max_hr_t]
+                    if hr_candidates:
+                        futures[executor.submit(
+                            process_image_pair, lr_name, lr_fld, lr_time, hr_candidates, hr_fld, hr_ts_data,
+                            hr_cache=hr_cache, vram_cache=None, use_gpu=_use_gpu, gpu_matcher=gpu_matcher
+                        )] = (lr_name, lr_time)
+
+                for fut in tqdm(concurrent.futures.as_completed(futures), total=len(futures), desc=f"Matching {vid_name}"):
+                    lr_name_done, lr_time_done = futures[fut]
+                    try:
+                        if res := fut.result():
+                            raw_matches.append((lr_name_done, res[0], res[2], res[3]))
+                            if not first_match_done or res[2] > last_lr_ts:
+                                last_lr_ts, last_hr_ts, first_match_done = res[2], res[3], True
+                    except Exception as e:
+                        print(f"Match worker error for {lr_name_done} ({vid_name}): {e}")
+
+        # Free cache memory after processing this video
+        if hr_cache:
+            hr_cache.clear()
+            del hr_cache
+        if vram_cache:
+            free_vram_cache(vram_cache)
 
         consistent_matches = filter_temporal_inconsistency(raw_matches, vid_name)
         copied = 0
@@ -749,6 +1099,7 @@ def process_folder_pair(lr_extracted_base: Path, hr_extracted_base: Path, out_lr
     
     update_progress(prog_file, stage, completed=True)
     print("--- Matching Finished ---")
+
 
 def filter_similar_images_phash(lr_matched: Path, hr_matched: Path, prog_file: Path):
     """Filter similar images using perceptual hashing."""
@@ -1212,7 +1563,7 @@ if __name__ == "__main__":
     extracted_fld.mkdir(exist_ok=True); matched_fld.mkdir(exist_ok=True); lr_matched_out.mkdir(exist_ok=True); hr_matched_out.mkdir(exist_ok=True)
 
     print("--- Pipeline Configuration ---")
-    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("HDR Mode", getattr(config, 'HDR_TONE_MAPPING_MODE', 'auto')), ("Content Fix", config.ATTEMPT_CONTENT_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("ImgAlign Timeout", f"{config.IMG_ALIGN_TIMEOUT_HOURS}h"), ("ImgAlign Batch Size", config.IMG_ALIGN_MAX_BATCH_SIZE), ("ImgAlign LR Color", config.IMG_ALIGN_ENABLE_LR_COLOR_COPY)]:
+    for k, v in [("LR Input", lr_in), ("HR Input", hr_in), ("Output Base", out_base), ("Deinterlace Mode", config.DEINTERLACE_MODE), ("Chroma Upsampling", config.ENABLE_CHROMA_UPSAMPLING), ("HDR Tone Mapping", config.ENABLE_HDR_TONE_MAPPING), ("HDR Mode", getattr(config, 'HDR_TONE_MAPPING_MODE', 'auto')), ("Content Fix", config.ATTEMPT_CONTENT_FIX), ("Autocrop Black", f"{config.CROP_BLACK_BORDERS}, Thresh: {config.CROP_BLACK_THRESHOLD if config.CROP_BLACK_BORDERS else 'N/A'}"), ("Autocrop White", f"{config.CROP_WHITE_BORDERS}, Thresh: {config.CROP_WHITE_THRESHOLD if config.CROP_WHITE_BORDERS else 'N/A'}"), ("Low Info Filter", f"{config.ENABLE_LOW_INFO_FILTER}, Thresh: {config.LOW_INFO_VARIANCE_THRESHOLD if config.ENABLE_LOW_INFO_FILTER else 'N/A'}"), ("Match Thresh", config.MATCH_THRESHOLD), ("Match GPU Mode", getattr(config, 'MATCH_USE_GPU', 'auto')), ("Match Cache Mode", getattr(config, 'MATCH_CACHE_MODE', 'ram')), ("pHash Thresh", config.PHASH_SIMILARITY_THRESHOLD), ("ImgAlign Scale", config.IMG_ALIGN_SCALE), ("ImgAlign Timeout", f"{config.IMG_ALIGN_TIMEOUT_HOURS}h"), ("ImgAlign Batch Size", config.IMG_ALIGN_MAX_BATCH_SIZE), ("ImgAlign LR Color", config.IMG_ALIGN_ENABLE_LR_COLOR_COPY)]:
         print(f"{k}: {v}")
 
     print("\n=== Stage 1: Preprocessing (Frame Extraction) ===")
